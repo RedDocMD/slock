@@ -15,20 +15,29 @@
 #include <unistd.h>
 #include <spawn.h>
 #include <sys/types.h>
+#include <sys/eventfd.h>
+#include <sys/epoll.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <security/pam_appl.h>
+#include <security/pam_misc.h>
+#include <pthread.h>
+#include <cairo/cairo-xlib.h>
 
 #include "arg.h"
 #include "util.h"
 
 char *argv0;
+static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_response **resp, void *appdata_ptr);
+char passwd[256];
 
 enum {
 	INIT,
 	INPUT,
 	FAILED,
+	PAM,
 	NUMCOLS
 };
 
@@ -43,6 +52,29 @@ struct xrandr {
 	int active;
 	int evbase;
 	int errbase;
+};
+
+enum {
+	CMD_RUN_PAM = 1,
+	CMD_PRINT,
+	CMD_INPUT,
+	CMD_SUCCESS,
+	CMD_FAILURE,
+};
+
+struct pam_thread_args {
+	int rx_fd;
+	int tx_fd;
+	char *inp_str;
+	char *out_str;
+	char *hash;
+};
+
+enum {
+	ST_NORMAL,
+	ST_PAM_STARTED,
+	ST_PAM_INPUT,
+	ST_DONE,
 };
 
 #include "config.h"
@@ -122,7 +154,150 @@ gethash(void)
 	}
 #endif /* HAVE_SHADOW_H */
 
+	/* pam, store user name */
+	hash = pw->pw_name;
 	return hash;
+}
+
+static void 
+read_cmd(int fd, uint64_t *cmd)
+{
+	if (read(fd, cmd, sizeof(*cmd)) != sizeof(*cmd))
+		die("Failed to read from fd: %s\n", strerror(errno));
+}
+
+static void 
+write_cmd(int fd, uint64_t *cmd)
+{
+	if (write(fd, cmd, sizeof(*cmd)) != sizeof(*cmd))
+		die("Failed to write from fd: %s\n", strerror(errno));
+}
+
+static int
+pam_conv(int num_msg, const struct pam_message **msgs,
+	 struct pam_response **resp, void *arg)
+{
+	struct pam_thread_args *ptarg = arg;
+	const struct pam_message *msg = *msgs;
+	struct pam_response *resp_msg;
+	uint64_t cmd;
+
+	if (num_msg != 1)
+		die("Too many PAM messages: %d\n", num_msg);
+
+	free(ptarg->out_str);
+	ptarg->out_str = strdup(msg->msg);
+
+	switch (msg->msg_style) {
+	case PAM_PROMPT_ECHO_OFF:
+	case PAM_PROMPT_ECHO_ON:
+		cmd = CMD_INPUT;
+		write_cmd(ptarg->tx_fd, &cmd);
+		read_cmd(ptarg->rx_fd, &cmd);
+		if (cmd != CMD_INPUT)
+			die("Unexpected command: %d\n", CMD_INPUT);
+		resp_msg = malloc(sizeof(struct pam_response));
+		resp_msg->resp_retcode = 0;
+		resp_msg->resp = strdup(ptarg->inp_str);
+		*resp = resp_msg;
+		break;
+	case PAM_ERROR_MSG:
+	case PAM_TEXT_INFO:
+		cmd = CMD_PRINT;
+		write_cmd(ptarg->tx_fd, &cmd);
+		break;
+	}
+	return PAM_SUCCESS;
+}
+
+static void *
+pam_thread_func(void *arg)
+{
+	struct pam_thread_args *ptarg = arg;
+	uint64_t cmd;
+	pam_handle_t *pamh;
+	struct pam_conv pamc = {pam_conv, arg};
+	int retval;
+
+	while (1) {
+		read_cmd(ptarg->rx_fd, &cmd);
+		if (cmd != CMD_RUN_PAM)
+			continue;
+		retval = pam_start(pam_service, ptarg->hash, &pamc, &pamh);
+		if (retval == PAM_SUCCESS)
+			retval = pam_authenticate(pamh, 0);
+		if (retval == PAM_SUCCESS)
+			retval = pam_acct_mgmt(pamh, 0);
+		if (retval == PAM_SUCCESS)
+			cmd = CMD_SUCCESS;
+		else
+			cmd = CMD_FAILURE;
+		pam_end(pamh, retval);
+		write_cmd(ptarg->tx_fd, &cmd);
+	}
+
+	return NULL;
+}
+
+static void
+epoll_add(int ep_fd, int fd) {
+	struct epoll_event ev;
+	ev.events = EPOLLIN;
+	ev.data.fd = fd;
+	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
+		die("Failed to add %d to epoll fd %d: %s\n", fd, ep_fd, strerror(errno));	
+}
+
+static void
+show_text(Display *dpy, Window win, int screen, char *text, cairo_t *cr, cairo_surface_t *sfc)
+{
+	int xpos, ypos;
+	XRRScreenResources *res;
+	XRRCrtcInfo *crtc;
+	cairo_text_extents_t dim;
+
+	XClearWindow(dpy, win);
+	cairo_set_source_rgb(cr, font_color.r, font_color.g, font_color.b);
+	cairo_select_font_face(cr, font, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+	cairo_set_font_size(cr, font_size);
+	cairo_text_extents(cr, text, &dim);
+
+	if (!(res = XRRGetScreenResourcesCurrent(dpy, win)))
+		die("Failed to get screen resources\n");
+	for (int i = 0; i < res->ncrtc; i++) {
+		crtc = XRRGetCrtcInfo(dpy, res, res->crtcs[i]);
+		if (!crtc)
+			continue;
+		if (crtc->noutput > 0 && crtc->width > 0 && crtc->height > 0) {
+			xpos = crtc->x + crtc->width / 2 - (int)dim.width / 2;
+			ypos = crtc->y + crtc->height / 2 - (int)dim.height / 2;
+			cairo_move_to(cr, xpos, ypos);
+			cairo_show_text(cr, text);
+		}
+		XRRFreeCrtcInfo(crtc);
+	}
+	XRRFreeScreenResources(res);
+	cairo_surface_flush(sfc);
+	XFlush(dpy);
+}
+
+static void
+show_text_all_screens(Display *dpy, struct lock **locks, cairo_surface_t **surfaces,
+		      cairo_t **crs, int nscreens, char *msg, int pwlen)
+{
+	if (!msg)
+		return;
+	int totlen, msglen;
+	char *pwmsg;
+	msglen = strlen(msg);
+	totlen = msglen + pwlen;
+	pwmsg = malloc(totlen + 1);
+	strcpy(pwmsg, msg);
+	memset(pwmsg + msglen, '*', pwlen);
+	pwmsg[totlen] = '\0';
+	for (int i = 0; i < nscreens; i++)
+		show_text(dpy, locks[i]->win, locks[i]->screen, pwmsg, crs[i], surfaces[i]);
+	free(pwmsg);
 }
 
 static void
@@ -130,19 +305,100 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
        const char *hash)
 {
 	XRRScreenChangeNotifyEvent *rre;
-	char buf[32], passwd[256], *inputhash;
-	int num, screen, running, failure, oldc;
+	char buf[32], *msg;
+	int num, screen, running, failure, oldc, 
+		nfds, ep_fd, disp_fd = ConnectionNumber(dpy), state = ST_NORMAL,
+		disp_ev = 0, rd_ev = 0, repaint = 0, pwch = 0;
 	unsigned int len, color;
 	KeySym ksym;
 	XEvent ev;
+	pthread_t tid;
+	struct pam_thread_args args;
+	struct epoll_event epv[2];
+	uint64_t cmd;
+	cairo_surface_t **surfaces;
+	cairo_t **crs;
+	Drawable win;
+
+	explicit_bzero(&args, sizeof(args));
+	args.hash = strdup(hash);
+	if ((args.rx_fd = eventfd(0, 0)) < 0)
+		die("Failed to create eventfd: %s", strerror(errno));
+	if ((args.tx_fd = eventfd(0, 0)) < 0)
+		die("Failed to create eventfd: %s", strerror(errno));
+	if (pthread_create(&tid, NULL, pam_thread_func, &args) != 0)
+		die("Failed to spawn pam thread\n");
+
+	surfaces = calloc(nscreens, sizeof(*surfaces));
+	crs = calloc(nscreens, sizeof(*crs));
+	for (int k = 0; k < nscreens; k++) {
+		win = locks[k]->win;
+		screen = locks[k]->screen;
+		XMapWindow(dpy, win);
+		surfaces[k] = cairo_xlib_surface_create(dpy, win, DefaultVisual(dpy, screen), DisplayWidth(dpy, screen), DisplayHeight(dpy, screen));
+		crs[k] = cairo_create(surfaces[k]);
+	}
 
 	len = 0;
 	running = 1;
 	failure = 0;
 	oldc = INIT;
+	msg = NULL;
 
-	while (running && !XNextEvent(dpy, &ev)) {
-		if (ev.type == KeyPress) {
+	if ((ep_fd = epoll_create1(0)) < 0)
+		die("Failed to create epoll fd: %s", strerror(errno));
+	epoll_add(ep_fd, args.tx_fd);
+	epoll_add(ep_fd, disp_fd);
+
+	while (running) {
+		if ((nfds = epoll_wait(ep_fd, epv, 2, -1)) < 0)
+			die("epoll failed: %s", strerror(errno));
+
+		rd_ev = 0;
+		disp_ev = 0;
+		repaint = 0;
+		pwch = 0;
+
+		for (int i = 0; i < nfds; i++) {
+			if (epv[i].data.fd == disp_fd) {
+				XNextEvent(dpy, &ev);
+				disp_ev = 1;
+			} else {
+				read_cmd(epv[i].data.fd, &cmd);
+				rd_ev = 1;
+			}
+		}
+		if (rd_ev) {
+			switch (state) {
+			case ST_NORMAL:
+			case ST_PAM_INPUT:
+				die("Cannot receive command in NORMAL or PAM_INPUT state\n");
+			case ST_PAM_STARTED:
+				if (cmd == CMD_PRINT) {
+					free(msg);
+					msg = strdup(args.out_str);
+					show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+				} else if (cmd == CMD_INPUT) {
+					free(msg);
+					msg = strdup(args.out_str);
+					show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+					state = ST_PAM_INPUT;
+				} else if (cmd == CMD_SUCCESS) {
+					running = 0;
+					state = ST_DONE;
+					continue;
+				} else if (cmd == CMD_FAILURE) {
+					failure = 1;
+					repaint = 1;
+					state = ST_NORMAL;
+					free(msg);
+					msg = NULL;
+					XSync(dpy, False);
+					XBell(dpy, 100);
+				}
+			}
+		}
+		if (disp_ev && ev.type == KeyPress) {
 			explicit_bzero(&buf, sizeof(buf));
 			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym, 0);
 			if (IsKeypadKey(ksym)) {
@@ -159,44 +415,51 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				continue;
 			switch (ksym) {
 			case XK_Return:
-				passwd[len] = '\0';
-				errno = 0;
-				if (!(inputhash = crypt(passwd, hash)))
-					fprintf(stderr, "slock: crypt: %s\n", strerror(errno));
-				else
-					running = !!strcmp(inputhash, hash);
-				if (running) {
-					XBell(dpy, 100);
-					failure = 1;
+				if (state == ST_NORMAL && ev.xkey.state & ShiftMask) {
+					state = ST_PAM_STARTED;
+					cmd = CMD_RUN_PAM;
+					write_cmd(args.rx_fd, &cmd);
+					repaint = 1;
+				} else if (state == ST_PAM_INPUT) {
+					passwd[len] = '\0';
+					free(args.inp_str);
+					args.inp_str = strdup(passwd);
+					cmd = CMD_INPUT;
+					write_cmd(args.rx_fd, &cmd);
+					explicit_bzero(&passwd, sizeof(passwd));
+					len = 0;
+					state = ST_PAM_STARTED;
+					repaint = 1;
 				}
-				explicit_bzero(&passwd, sizeof(passwd));
-				len = 0;
 				break;
 			case XK_Escape:
-				explicit_bzero(&passwd, sizeof(passwd));
-				len = 0;
+				if (state == ST_PAM_INPUT) {
+					explicit_bzero(&passwd, sizeof(passwd));
+					len = 0;
+					repaint = 1;
+					pwch = 1;
+				}
 				break;
 			case XK_BackSpace:
-				if (len)
-					passwd[--len] = '\0';
+				if (state == ST_PAM_INPUT) {
+					if (len) {
+						passwd[--len] = '\0';
+						repaint = 1;
+						pwch = 1;
+					}
+				}
 				break;
 			default:
-				if (num && !iscntrl((int)buf[0]) &&
-				    (len + num < sizeof(passwd))) {
-					memcpy(passwd + len, buf, num);
-					len += num;
+				if (state == ST_PAM_INPUT) {
+					if (num && !iscntrl((int)buf[0]) &&
+					    (len + num < sizeof(passwd))) {
+						memcpy(passwd + len, buf, num);
+						len += num;
+						repaint = 1;
+						pwch = 1;
+					}
 				}
 				break;
-			}
-			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
-			if (running && oldc != color) {
-				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
-					XClearWindow(dpy, locks[screen]->win);
-				}
-				oldc = color;
 			}
 		} else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
 			rre = (XRRScreenChangeNotifyEvent*)&ev;
@@ -213,9 +476,29 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 					break;
 				}
 			}
+			show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
 		} else {
 			for (screen = 0; screen < nscreens; screen++)
 				XRaiseWindow(dpy, locks[screen]->win);
+		}
+		if (repaint) {
+			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
+			if (state == ST_PAM_STARTED) {
+				color = PAM;
+			}
+			if (running && oldc != color) {
+				for (screen = 0; screen < nscreens; screen++) {
+					XSetWindowBackground(dpy,
+					                     locks[screen]->win,
+					                     locks[screen]->colors[color]);
+					XClearWindow(dpy, locks[screen]->win);
+				}
+				oldc = color;
+				XFlush(dpy);
+			}
+			if (pwch) {
+				show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+			}
 		}
 	}
 }
@@ -340,10 +623,9 @@ main(int argc, char **argv) {
 	dontkillme();
 #endif
 
+	/* the contents of hash are used to transport the current user name */
 	hash = gethash();
 	errno = 0;
-	if (!crypt("", hash))
-		die("slock: crypt: %s\n", strerror(errno));
 
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("slock: cannot open display\n");
