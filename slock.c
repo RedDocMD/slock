@@ -68,6 +68,8 @@ struct pam_thread_args {
 	char *inp_str;
 	char *out_str;
 	char *hash;
+	int dgid;
+	int duid;
 };
 
 enum {
@@ -115,6 +117,17 @@ dontkillme(void)
 	}
 }
 #endif
+
+static void
+drop_privilleges(int dgid, int duid)
+{
+	if (setgroups(0, NULL) < 0)
+		die("slock: setgroups: %s\n", strerror(errno));
+	if (setgid(dgid) < 0)
+		die("slock: setgid: %s\n", strerror(errno));
+	if (setuid(duid) < 0)
+		die("slock: setuid: %s\n", strerror(errno));
+}
 
 static const char *
 gethash(void)
@@ -219,6 +232,10 @@ pam_thread_func(void *arg)
 	struct pam_conv pamc = {pam_conv, arg};
 	int retval;
 
+#ifdef __linux__
+	dontkillme();
+#endif
+
 	while (1) {
 		read_cmd(ptarg->rx_fd, &cmd);
 		if (cmd != CMD_RUN_PAM)
@@ -302,7 +319,7 @@ show_text_all_screens(Display *dpy, struct lock **locks, cairo_surface_t **surfa
 
 static void
 readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
-       const char *hash)
+       const char *hash, struct pam_thread_args *args)
 {
 	XRRScreenChangeNotifyEvent *rre;
 	char buf[32], *msg;
@@ -312,22 +329,11 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 	unsigned int len, color;
 	KeySym ksym;
 	XEvent ev;
-	pthread_t tid;
-	struct pam_thread_args args;
 	struct epoll_event epv[2];
 	uint64_t cmd;
 	cairo_surface_t **surfaces;
 	cairo_t **crs;
 	Drawable win;
-
-	explicit_bzero(&args, sizeof(args));
-	args.hash = strdup(hash);
-	if ((args.rx_fd = eventfd(0, 0)) < 0)
-		die("Failed to create eventfd: %s", strerror(errno));
-	if ((args.tx_fd = eventfd(0, 0)) < 0)
-		die("Failed to create eventfd: %s", strerror(errno));
-	if (pthread_create(&tid, NULL, pam_thread_func, &args) != 0)
-		die("Failed to spawn pam thread\n");
 
 	surfaces = calloc(nscreens, sizeof(*surfaces));
 	crs = calloc(nscreens, sizeof(*crs));
@@ -347,7 +353,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 
 	if ((ep_fd = epoll_create1(0)) < 0)
 		die("Failed to create epoll fd: %s", strerror(errno));
-	epoll_add(ep_fd, args.tx_fd);
+	epoll_add(ep_fd, args->tx_fd);
 	epoll_add(ep_fd, disp_fd);
 
 	while (running) {
@@ -376,11 +382,11 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			case ST_PAM_STARTED:
 				if (cmd == CMD_PRINT) {
 					free(msg);
-					msg = strdup(args.out_str);
+					msg = strdup(args->out_str);
 					show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
 				} else if (cmd == CMD_INPUT) {
 					free(msg);
-					msg = strdup(args.out_str);
+					msg = strdup(args->out_str);
 					show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
 					state = ST_PAM_INPUT;
 				} else if (cmd == CMD_SUCCESS) {
@@ -418,14 +424,14 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				if (state == ST_NORMAL && ev.xkey.state & ShiftMask) {
 					state = ST_PAM_STARTED;
 					cmd = CMD_RUN_PAM;
-					write_cmd(args.rx_fd, &cmd);
+					write_cmd(args->rx_fd, &cmd);
 					repaint = 1;
 				} else if (state == ST_PAM_INPUT) {
 					passwd[len] = '\0';
-					free(args.inp_str);
-					args.inp_str = strdup(passwd);
+					free(args->inp_str);
+					args->inp_str = strdup(passwd);
 					cmd = CMD_INPUT;
-					write_cmd(args.rx_fd, &cmd);
+					write_cmd(args->rx_fd, &cmd);
 					explicit_bzero(&passwd, sizeof(passwd));
 					len = 0;
 					state = ST_PAM_STARTED;
@@ -598,6 +604,11 @@ main(int argc, char **argv) {
 	const char *hash;
 	Display *dpy;
 	int s, nlocks, nscreens;
+	struct pam_thread_args pargs;
+	pthread_t ptid;
+
+	freopen(log_file, "w", stdout);
+	freopen(log_file, "w", stderr);
 
 	ARGBEGIN {
 	case 'v':
@@ -627,16 +638,21 @@ main(int argc, char **argv) {
 	hash = gethash();
 	errno = 0;
 
+	explicit_bzero(&pargs, sizeof(pargs));
+	pargs.hash = strdup(hash);
+	pargs.dgid = dgid;
+	pargs.duid = duid;
+	if ((pargs.rx_fd = eventfd(0, 0)) < 0)
+		die("Failed to create eventfd: %s", strerror(errno));
+	if ((pargs.tx_fd = eventfd(0, 0)) < 0)
+		die("Failed to create eventfd: %s", strerror(errno));
+	if (pthread_create(&ptid, NULL, pam_thread_func, &pargs) != 0)
+		die("Failed to spawn pam thread\n");
+
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("slock: cannot open display\n");
 
-	/* drop privileges */
-	if (setgroups(0, NULL) < 0)
-		die("slock: setgroups: %s\n", strerror(errno));
-	if (setgid(dgid) < 0)
-		die("slock: setgid: %s\n", strerror(errno));
-	if (setuid(duid) < 0)
-		die("slock: setuid: %s\n", strerror(errno));
+	drop_privilleges(dgid, duid);
 
 	/* check for Xrandr support */
 	rr.active = XRRQueryExtension(dpy, &rr.evbase, &rr.errbase);
@@ -669,7 +685,7 @@ main(int argc, char **argv) {
 	}
 
 	/* everything is now blank. Wait for the correct password */
-	readpw(dpy, &rr, locks, nscreens, hash);
+	readpw(dpy, &rr, locks, nscreens, hash, &pargs);
 
 	return 0;
 }
