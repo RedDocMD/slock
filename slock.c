@@ -30,16 +30,11 @@
 #include "util.h"
 
 char *argv0;
-static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_response **resp, void *appdata_ptr);
+static int pam_conv(int num_msg, const struct pam_message **msg,
+		    struct pam_response **resp, void *appdata_ptr);
 char passwd[256];
 
-enum {
-	INIT,
-	INPUT,
-	FAILED,
-	PAM,
-	NUMCOLS
-};
+enum { INIT, INPUT, FAILED, PAM, NUMCOLS };
 
 struct lock {
 	int screen;
@@ -81,8 +76,7 @@ enum {
 
 #include "config.h"
 
-static void
-die(const char *errstr, ...)
+static void die(const char *errstr, ...)
 {
 	va_list ap;
 
@@ -96,8 +90,7 @@ die(const char *errstr, ...)
 #include <fcntl.h>
 #include <linux/oom.h>
 
-static void
-dontkillme(void)
+static void dontkillme(void)
 {
 	FILE *f;
 	const char oomfile[] = "/proc/self/oom_score_adj";
@@ -118,8 +111,7 @@ dontkillme(void)
 }
 #endif
 
-static void
-drop_privilleges(int dgid, int duid)
+static void drop_privilleges(int dgid, int duid)
 {
 	if (setgroups(0, NULL) < 0)
 		die("slock: setgroups: %s\n", strerror(errno));
@@ -129,8 +121,7 @@ drop_privilleges(int dgid, int duid)
 		die("slock: setuid: %s\n", strerror(errno));
 }
 
-static const char *
-gethash(void)
+static const char *gethash(void)
 {
 	const char *hash;
 	struct passwd *pw;
@@ -172,23 +163,20 @@ gethash(void)
 	return hash;
 }
 
-static void 
-read_cmd(int fd, uint64_t *cmd)
+static void read_cmd(int fd, uint64_t *cmd)
 {
 	if (read(fd, cmd, sizeof(*cmd)) != sizeof(*cmd))
 		die("Failed to read from fd: %s\n", strerror(errno));
 }
 
-static void 
-write_cmd(int fd, uint64_t *cmd)
+static void write_cmd(int fd, uint64_t *cmd)
 {
 	if (write(fd, cmd, sizeof(*cmd)) != sizeof(*cmd))
 		die("Failed to write from fd: %s\n", strerror(errno));
 }
 
-static int
-pam_conv(int num_msg, const struct pam_message **msgs,
-	 struct pam_response **resp, void *arg)
+static int pam_conv(int num_msg, const struct pam_message **msgs,
+		    struct pam_response **resp, void *arg)
 {
 	struct pam_thread_args *ptarg = arg;
 	const struct pam_message *msg = *msgs;
@@ -223,13 +211,12 @@ pam_conv(int num_msg, const struct pam_message **msgs,
 	return PAM_SUCCESS;
 }
 
-static void *
-pam_thread_func(void *arg)
+static void *pam_thread_func(void *arg)
 {
 	struct pam_thread_args *ptarg = arg;
 	uint64_t cmd;
 	pam_handle_t *pamh;
-	struct pam_conv pamc = {pam_conv, arg};
+	struct pam_conv pamc = { pam_conv, arg };
 	int retval;
 
 #ifdef __linux__
@@ -256,17 +243,18 @@ pam_thread_func(void *arg)
 	return NULL;
 }
 
-static void
-epoll_add(int ep_fd, int fd) {
+static void epoll_add(int ep_fd, int fd)
+{
 	struct epoll_event ev;
 	ev.events = EPOLLIN;
 	ev.data.fd = fd;
 	if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
-		die("Failed to add %d to epoll fd %d: %s\n", fd, ep_fd, strerror(errno));	
+		die("Failed to add %d to epoll fd %d: %s\n", fd, ep_fd,
+		    strerror(errno));
 }
 
-static void
-show_text(Display *dpy, Window win, int screen, char *text, cairo_t *cr, cairo_surface_t *sfc)
+static void show_text(Display *dpy, Window win, int screen, char *text,
+		      cairo_t *cr, cairo_surface_t *sfc)
 {
 	int xpos, ypos;
 	XRRScreenResources *res;
@@ -275,7 +263,8 @@ show_text(Display *dpy, Window win, int screen, char *text, cairo_t *cr, cairo_s
 
 	XClearWindow(dpy, win);
 	cairo_set_source_rgb(cr, font_color.r, font_color.g, font_color.b);
-	cairo_select_font_face(cr, font, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+	cairo_select_font_face(cr, font, CAIRO_FONT_SLANT_NORMAL,
+			       CAIRO_FONT_WEIGHT_BOLD);
 	cairo_set_font_size(cr, font_size);
 	cairo_text_extents(cr, text, &dim);
 
@@ -298,9 +287,9 @@ show_text(Display *dpy, Window win, int screen, char *text, cairo_t *cr, cairo_s
 	XFlush(dpy);
 }
 
-static void
-show_text_all_screens(Display *dpy, struct lock **locks, cairo_surface_t **surfaces,
-		      cairo_t **crs, int nscreens, char *msg, int pwlen)
+static void show_text_all_screens(Display *dpy, struct lock **locks,
+				  cairo_surface_t **surfaces, cairo_t **crs,
+				  int nscreens, char *msg, int pwlen)
 {
 	if (!msg)
 		return;
@@ -313,19 +302,19 @@ show_text_all_screens(Display *dpy, struct lock **locks, cairo_surface_t **surfa
 	memset(pwmsg + msglen, '*', pwlen);
 	pwmsg[totlen] = '\0';
 	for (int i = 0; i < nscreens; i++)
-		show_text(dpy, locks[i]->win, locks[i]->screen, pwmsg, crs[i], surfaces[i]);
+		show_text(dpy, locks[i]->win, locks[i]->screen, pwmsg, crs[i],
+			  surfaces[i]);
 	free(pwmsg);
 }
 
-static void
-readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
-       const char *hash, struct pam_thread_args *args)
+static void readpw(Display *dpy, struct xrandr *rr, struct lock **locks,
+		   int nscreens, const char *hash, struct pam_thread_args *args)
 {
 	XRRScreenChangeNotifyEvent *rre;
 	char buf[32], *msg;
-	int num, screen, running, failure, oldc, 
-		nfds, ep_fd, disp_fd = ConnectionNumber(dpy), state = ST_NORMAL,
-		disp_ev = 0, rd_ev = 0, repaint = 0, pwch = 0;
+	int num, screen, running, failure, oldc, nfds, ep_fd,
+		disp_fd = ConnectionNumber(dpy), state = ST_NORMAL, disp_ev = 0,
+		rd_ev = 0, repaint = 0, pwch = 0;
 	unsigned int len, color;
 	KeySym ksym;
 	XEvent ev;
@@ -341,7 +330,9 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 		win = locks[k]->win;
 		screen = locks[k]->screen;
 		XMapWindow(dpy, win);
-		surfaces[k] = cairo_xlib_surface_create(dpy, win, DefaultVisual(dpy, screen), DisplayWidth(dpy, screen), DisplayHeight(dpy, screen));
+		surfaces[k] = cairo_xlib_surface_create(
+			dpy, win, DefaultVisual(dpy, screen),
+			DisplayWidth(dpy, screen), DisplayHeight(dpy, screen));
 		crs[k] = cairo_create(surfaces[k]);
 	}
 
@@ -357,8 +348,14 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 	epoll_add(ep_fd, disp_fd);
 
 	while (running) {
-		if ((nfds = epoll_wait(ep_fd, epv, 2, -1)) < 0)
+		if ((nfds = epoll_wait(ep_fd, epv, 2, -1)) < 0) {
+			if (errno == EINTR) {
+				fprintf(stderr, "epoll_wait interrupted\n");
+				sleep(1);
+				continue;
+			}
 			die("epoll failed: %s", strerror(errno));
+		}
 
 		rd_ev = 0;
 		disp_ev = 0;
@@ -383,11 +380,17 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				if (cmd == CMD_PRINT) {
 					free(msg);
 					msg = strdup(args->out_str);
-					show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+					show_text_all_screens(dpy, locks,
+							      surfaces, crs,
+							      nscreens, msg,
+							      len);
 				} else if (cmd == CMD_INPUT) {
 					free(msg);
 					msg = strdup(args->out_str);
-					show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+					show_text_all_screens(dpy, locks,
+							      surfaces, crs,
+							      nscreens, msg,
+							      len);
 					state = ST_PAM_INPUT;
 				} else if (cmd == CMD_SUCCESS) {
 					running = 0;
@@ -406,22 +409,22 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 		}
 		if (disp_ev && ev.type == KeyPress) {
 			explicit_bzero(&buf, sizeof(buf));
-			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym, 0);
+			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym,
+					    0);
 			if (IsKeypadKey(ksym)) {
 				if (ksym == XK_KP_Enter)
 					ksym = XK_Return;
 				else if (ksym >= XK_KP_0 && ksym <= XK_KP_9)
 					ksym = (ksym - XK_KP_0) + XK_0;
 			}
-			if (IsFunctionKey(ksym) ||
-			    IsKeypadKey(ksym) ||
-			    IsMiscFunctionKey(ksym) ||
-			    IsPFKey(ksym) ||
+			if (IsFunctionKey(ksym) || IsKeypadKey(ksym) ||
+			    IsMiscFunctionKey(ksym) || IsPFKey(ksym) ||
 			    IsPrivateKeypadKey(ksym))
 				continue;
 			switch (ksym) {
 			case XK_Return:
-				if (state == ST_NORMAL && ev.xkey.state & ShiftMask) {
+				if (state == ST_NORMAL &&
+				    ev.xkey.state & ShiftMask) {
 					state = ST_PAM_STARTED;
 					cmd = CMD_RUN_PAM;
 					write_cmd(args->rx_fd, &cmd);
@@ -467,52 +470,60 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				}
 				break;
 			}
-		} else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
-			rre = (XRRScreenChangeNotifyEvent*)&ev;
+		} else if (rr->active &&
+			   ev.type == rr->evbase + RRScreenChangeNotify) {
+			rre = (XRRScreenChangeNotifyEvent *)&ev;
 			for (screen = 0; screen < nscreens; screen++) {
 				if (locks[screen]->win == rre->window) {
 					if (rre->rotation == RR_Rotate_90 ||
 					    rre->rotation == RR_Rotate_270)
-						XResizeWindow(dpy, locks[screen]->win,
-						              rre->height, rre->width);
+						XResizeWindow(
+							dpy, locks[screen]->win,
+							rre->height,
+							rre->width);
 					else
-						XResizeWindow(dpy, locks[screen]->win,
-						              rre->width, rre->height);
+						XResizeWindow(
+							dpy, locks[screen]->win,
+							rre->width,
+							rre->height);
 					XClearWindow(dpy, locks[screen]->win);
 					break;
 				}
 			}
-			show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+			show_text_all_screens(dpy, locks, surfaces, crs,
+					      nscreens, msg, len);
 		} else {
 			for (screen = 0; screen < nscreens; screen++)
 				XRaiseWindow(dpy, locks[screen]->win);
 		}
 		if (repaint) {
-			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
+			color = len ? INPUT :
+				      ((failure || failonclear) ? FAILED :
+								  INIT);
 			if (state == ST_PAM_STARTED) {
 				color = PAM;
 			}
 			if (running && oldc != color) {
 				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
+					XSetWindowBackground(
+						dpy, locks[screen]->win,
+						locks[screen]->colors[color]);
 					XClearWindow(dpy, locks[screen]->win);
 				}
 				oldc = color;
 				XFlush(dpy);
 			}
 			if (pwch) {
-				show_text_all_screens(dpy, locks, surfaces, crs, nscreens, msg, len);
+				show_text_all_screens(dpy, locks, surfaces, crs,
+						      nscreens, msg, len);
 			}
 		}
 	}
 }
 
-static struct lock *
-lockscreen(Display *dpy, struct xrandr *rr, int screen)
+static struct lock *lockscreen(Display *dpy, struct xrandr *rr, int screen)
 {
-	char curs[] = {0, 0, 0, 0, 0, 0, 0, 0};
+	char curs[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	int i, ptgrab, kbgrab;
 	struct lock *lock;
 	XColor color, dummy;
@@ -527,7 +538,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 
 	for (i = 0; i < NUMCOLS; i++) {
 		XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
-		                 colorname[i], &color, &dummy);
+				 colorname[i], &color, &dummy);
 		lock->colors[i] = color.pixel;
 	}
 
@@ -535,35 +546,39 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	wa.override_redirect = 1;
 	wa.background_pixel = lock->colors[INIT];
 	lock->win = XCreateWindow(dpy, lock->root, 0, 0,
-	                          DisplayWidth(dpy, lock->screen),
-	                          DisplayHeight(dpy, lock->screen),
-	                          0, DefaultDepth(dpy, lock->screen),
-	                          CopyFromParent,
-	                          DefaultVisual(dpy, lock->screen),
-	                          CWOverrideRedirect | CWBackPixel, &wa);
+				  DisplayWidth(dpy, lock->screen),
+				  DisplayHeight(dpy, lock->screen), 0,
+				  DefaultDepth(dpy, lock->screen),
+				  CopyFromParent,
+				  DefaultVisual(dpy, lock->screen),
+				  CWOverrideRedirect | CWBackPixel, &wa);
 	lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
-	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
-	                                &color, &color, 0, 0);
+	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap, &color,
+					&color, 0, 0);
 	XDefineCursor(dpy, lock->win, invisible);
 
 	/* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
 	for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
 		if (ptgrab != GrabSuccess) {
 			ptgrab = XGrabPointer(dpy, lock->root, False,
-			                      ButtonPressMask | ButtonReleaseMask |
-			                      PointerMotionMask, GrabModeAsync,
-			                      GrabModeAsync, None, invisible, CurrentTime);
+					      ButtonPressMask |
+						      ButtonReleaseMask |
+						      PointerMotionMask,
+					      GrabModeAsync, GrabModeAsync,
+					      None, invisible, CurrentTime);
 		}
 		if (kbgrab != GrabSuccess) {
 			kbgrab = XGrabKeyboard(dpy, lock->root, True,
-			                       GrabModeAsync, GrabModeAsync, CurrentTime);
+					       GrabModeAsync, GrabModeAsync,
+					       CurrentTime);
 		}
 
 		/* input is grabbed: we can lock the screen */
 		if (ptgrab == GrabSuccess && kbgrab == GrabSuccess) {
 			XMapRaised(dpy, lock->win);
 			if (rr->active)
-				XRRSelectInput(dpy, lock->win, RRScreenChangeNotifyMask);
+				XRRSelectInput(dpy, lock->win,
+					       RRScreenChangeNotifyMask);
 
 			XSelectInput(dpy, lock->root, SubstructureNotifyMask);
 			return lock;
@@ -579,22 +594,23 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 
 	/* we couldn't grab all input: fail out */
 	if (ptgrab != GrabSuccess)
-		fprintf(stderr, "slock: unable to grab mouse pointer for screen %d\n",
-		        screen);
+		fprintf(stderr,
+			"slock: unable to grab mouse pointer for screen %d\n",
+			screen);
 	if (kbgrab != GrabSuccess)
-		fprintf(stderr, "slock: unable to grab keyboard for screen %d\n",
-		        screen);
+		fprintf(stderr,
+			"slock: unable to grab keyboard for screen %d\n",
+			screen);
 	return NULL;
 }
 
-static void
-usage(void)
+static void usage(void)
 {
 	die("usage: slock [-v] [cmd [arg ...]]\n");
 }
 
-int
-main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
 	struct xrandr rr;
 	struct lock **locks;
 	struct passwd *pwd;
@@ -610,13 +626,15 @@ main(int argc, char **argv) {
 	freopen(log_file, "w", stdout);
 	freopen(log_file, "w", stderr);
 
-	ARGBEGIN {
+	ARGBEGIN
+	{
 	case 'v':
-		puts("slock-"VERSION);
+		puts("slock-" VERSION);
 		return 0;
 	default:
 		usage();
-	} ARGEND
+	}
+	ARGEND
 
 	/* validate drop-user and -group */
 	errno = 0;
@@ -677,7 +695,8 @@ main(int argc, char **argv) {
 	if (argc > 0) {
 		pid_t pid;
 		extern char **environ;
-		int err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+		int err =
+			posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
 		if (err) {
 			die("slock: failed to execute post-lock command: %s: %s\n",
 			    argv[0], strerror(err));
